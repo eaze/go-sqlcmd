@@ -35,10 +35,10 @@ func TestValidCommandLineToArgsConversion(t *testing.T) {
 			return len(args.Variables) == 2 && args.Variables["a"] == "b" && args.Variables["x"] == "y" && args.UseTrustedConnection
 		}},
 		{[]string{"-c", "MYGO", "-C", "-E", "-i", "file1", "-o", "outfile", "-i", "file2"}, func(args SQLCmdArguments) bool {
-			return args.BatchTerminator == "MYGO" && args.TrustServerCertificate && len(args.InputFile) == 2 && strings.HasSuffix(args.OutputFile, "outfile")
+			return args.BatchTerminator == "MYGO" && *args.TrustServerCertificate && len(args.InputFile) == 2 && strings.HasSuffix(args.OutputFile, "outfile")
 		}},
 		{[]string{"-U", "someuser", "-d", "somedatabase", "-S", "someserver"}, func(args SQLCmdArguments) bool {
-			return args.BatchTerminator == "GO" && !args.TrustServerCertificate && args.UserName == "someuser" && args.DatabaseName == "somedatabase" && args.Server == "someserver"
+			return args.BatchTerminator == "GO" && !*args.TrustServerCertificate && args.UserName == "someuser" && args.DatabaseName == "somedatabase" && args.Server == "someserver"
 		}},
 		// native sqlcmd allows both -q and -Q but only runs the -Q query and exits. We could make them mutually exclusive if desired.
 		{[]string{"-q", "select 1", "-Q", "select 2"}, func(args SQLCmdArguments) bool {
@@ -88,7 +88,7 @@ func TestValidCommandLineToArgsConversion(t *testing.T) {
 			return *args.FixedTypeWidth == 200 && *args.VariableTypeWidth == 100 && args.Password == "placeholder" && args.EchoInput
 		}},
 		{[]string{"-E", "-v", "a=b", "x=y", "-i", "a.sql", "b.sql", "-v", "f=g", "-i", "c.sql", "-C", "-v", "ab=cd", "ef=hi"}, func(args SQLCmdArguments) bool {
-			return args.UseTrustedConnection && args.Variables["x"] == "y" && len(args.InputFile) == 3 && args.InputFile[0] == "a.sql" && args.TrustServerCertificate
+			return args.UseTrustedConnection && args.Variables["x"] == "y" && len(args.InputFile) == 3 && args.InputFile[0] == "a.sql" && *args.TrustServerCertificate
 		}},
 		{[]string{"-i", `comma,text.sql`}, func(args SQLCmdArguments) bool {
 			return args.InputFile[0] == "comma" && args.InputFile[1] == "text.sql"
@@ -105,6 +105,9 @@ func TestValidCommandLineToArgsConversion(t *testing.T) {
 		{[]string{"-N", "m"}, func(args SQLCmdArguments) bool {
 			return args.EncryptConnection == "m"
 		}},
+		{[]string{"--connection-string", "foo"}, func(args SQLCmdArguments) bool {
+			return args.ConnectionString == "foo"
+		}},
 	}
 
 	for _, test := range commands {
@@ -115,6 +118,7 @@ func TestValidCommandLineToArgsConversion(t *testing.T) {
 			Long:  "A long description of my command",
 			PreRunE: func(cmd *cobra.Command, argss []string) error {
 				SetScreenWidthFlags(arguments, cmd)
+				SetBooleanArgs(&args, cmd)
 				return arguments.Validate(cmd)
 			},
 			Run: func(cmd *cobra.Command, argss []string) {
@@ -126,6 +130,10 @@ func TestValidCommandLineToArgsConversion(t *testing.T) {
 		cmd.SetOut(new(bytes.Buffer))
 		cmd.SetErr(new(bytes.Buffer))
 		setFlags(cmd, arguments)
+		vars := sqlcmd.InitializeVariables(false)
+		setVars(vars, &args)
+		var connectConfig sqlcmd.ConnectSettings
+		setConnect(&connectConfig, &args, vars)
 		cmd.SetArgs(convertOsArgs(test.commandLine))
 		err := cmd.Execute()
 		msg := ""
@@ -136,6 +144,62 @@ func TestValidCommandLineToArgsConversion(t *testing.T) {
 			assert.True(t, test.check(*arguments), "Unexpected SqlCmdArguments from: %v\n%+v", test.commandLine, *arguments)
 		}
 	}
+}
+
+func TestConnectionString(t *testing.T) {
+	args := newArguments()
+	args.DisableCmd = new(int)
+	*args.DisableCmd = 1
+	args.ConnectionString = "Server=tcp:go.dev\\gopher,1433;Initial Catalog=foo;Persist Security Info=False;User ID=bar;Password=qux;" +
+		"Encrypt=True;TrustServerCertificate=true;Connection Timeout=33;ApplicationIntent=ReadOnly;ColumnEncryption=true"
+	args.LoginTimeout = -1
+	vars := sqlcmd.InitializeVariables(args.useEnvVars())
+	setVars(vars, &args)
+	var connectConfig sqlcmd.ConnectSettings
+	setConnect(&connectConfig, &args, vars)
+	//t.Logf("%+v", connectConfig)
+	assert.Equal(t, "tcp:go.dev\\gopher,1433", connectConfig.ServerName, "Unexpected test result encountered for ServerName")
+	assert.Equal(t, "foo", connectConfig.Database, "Unexpected test result encountered for Database")
+	assert.Equal(t, "bar", connectConfig.UserName, "Unexpected test result encountered for UserName")
+	assert.Equal(t, "qux", connectConfig.Password, "Unexpected test result encountered for Password")
+	assert.Equal(t, "true", connectConfig.Encrypt, "Unexpected test result encountered for Encrypt")
+	assert.Equal(t, true, connectConfig.TrustServerCertificate, "Unexpected test result encountered for TrustServerCertificate")
+	assert.Equal(t, 33, connectConfig.LoginTimeoutSeconds, "Unexpected test result encountered for LoginTimeoutSeconds")
+	assert.Equal(t, "ReadOnly", connectConfig.ApplicationIntent, "Unexpected test result encountered for ApplicationIntent")
+	assert.Equal(t, true, connectConfig.EnableColumnEncryption, "Unexpected test result encountered for EnableColumnEncryption")
+}
+
+func TestConnectionStringOverrides(t *testing.T) {
+	args := newArguments()
+	args.DisableCmd = new(int)
+	*args.DisableCmd = 1
+	args.ConnectionString = "Server=tcp:go.dev\\gopher,1433;Initial Catalog=foo;Persist Security Info=False;User ID=bar;Password=qux;" +
+		"Encrypt=True;TrustServerCertificate=true;Connection Timeout=33;ColumnEncryption=true"
+	expected := "override"
+	args.UserName = expected
+	args.Password = expected
+	args.DatabaseName = expected
+	args.Server = "tcp:bar\\qux,1111"
+	args.ApplicationIntent = expected
+	args.LoginTimeout = 22
+	args.EncryptConnection = "false"
+	false := false
+	args.TrustServerCertificate = &false
+	args.EnableColumnEncryption = &false
+	vars := sqlcmd.InitializeVariables(args.useEnvVars())
+	setVars(vars, &args)
+	var connectConfig sqlcmd.ConnectSettings
+	setConnect(&connectConfig, &args, vars)
+	//t.Logf("%+v", connectConfig)
+	assert.Equal(t, "tcp:bar\\qux,1111", connectConfig.ServerName, "Unexpected test result encountered for ServerName")
+	assert.Equal(t, expected, connectConfig.Database, "Unexpected test result encountered for Database")
+	assert.Equal(t, expected, connectConfig.UserName, "Unexpected test result encountered for UserName")
+	assert.Equal(t, expected, connectConfig.Password, "Unexpected test result encountered for Password")
+	assert.Equal(t, "false", connectConfig.Encrypt, "Unexpected test result encountered for Encrypt")
+	assert.Equal(t, false, connectConfig.TrustServerCertificate, "Unexpected test result encountered for TrustServerCertificate")
+	assert.Equal(t, 22, connectConfig.LoginTimeoutSeconds, "Unexpected test result encountered for LoginTimeoutSeconds")
+	assert.Equal(t, expected, connectConfig.ApplicationIntent, "Unexpected test result encountered for ApplicationIntent")
+	assert.Equal(t, false, connectConfig.EnableColumnEncryption, "Unexpected test result encountered for EnableColumnEncryption")
 }
 
 func TestInvalidCommandLine(t *testing.T) {
@@ -167,6 +231,7 @@ func TestInvalidCommandLine(t *testing.T) {
 			Long:  "A long description of my command",
 			PreRunE: func(cmd *cobra.Command, argss []string) error {
 				SetScreenWidthFlags(arguments, cmd)
+				SetBooleanArgs(&args, cmd)
 				if err := arguments.Validate(cmd); err != nil {
 					cmd.SilenceUsage = true
 					return err
@@ -210,6 +275,7 @@ func TestValidateFlags(t *testing.T) {
 			Long:  "A long description of my command",
 			PreRunE: func(cmd *cobra.Command, argss []string) error {
 				SetScreenWidthFlags(arguments, cmd)
+				SetBooleanArgs(&args, cmd)
 				return arguments.Validate(cmd)
 			},
 			Run: func(cmd *cobra.Command, argss []string) {

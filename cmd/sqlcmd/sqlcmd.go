@@ -31,7 +31,7 @@ type SQLCmdArguments struct {
 	// Which batch terminator to use. Default is GO
 	BatchTerminator string
 	// Whether to trust the server certificate on an encrypted connection
-	TrustServerCertificate bool
+	TrustServerCertificate *bool
 	DatabaseName           string
 	UseTrustedConnection   bool
 	UserName               string
@@ -75,9 +75,10 @@ type SQLCmdArguments struct {
 	RemoveControlCharacters     *int
 	EchoInput                   bool
 	QueryTimeout                int
-	EnableColumnEncryption      bool
+	EnableColumnEncryption      *bool
 	ChangePassword              string
 	ChangePasswordAndExit       string
+	ConnectionString            string
 	// Keep Help at the end of the list
 	Help bool
 }
@@ -123,6 +124,8 @@ const (
 	disableCmdAndWarn       = "disable-cmd-and-warn"
 	listServers             = "list-servers"
 	removeControlCharacters = "remove-control-characters"
+	trustServerCertificate  = "trust-server-certificate"
+	enableColumnEncryption  = "enable-column-encryption"
 )
 
 // Validate arguments for settings not describe
@@ -203,6 +206,7 @@ func Execute(version string) {
 	rootCmd := &cobra.Command{
 		PreRunE: func(cmd *cobra.Command, argss []string) error {
 			SetScreenWidthFlags(&args, cmd)
+			SetBooleanArgs(&args, cmd)
 			if err := args.Validate(cmd); err != nil {
 				cmd.SilenceUsage = true
 				return err
@@ -377,6 +381,26 @@ func SetScreenWidthFlags(args *SQLCmdArguments, rootCmd *cobra.Command) {
 	args.RemoveControlCharacters = getOptionalIntArgument(rootCmd, removeControlCharacters)
 }
 
+func SetBooleanArgs(args *SQLCmdArguments, rootCmd *cobra.Command) {
+
+	args.TrustServerCertificate = GetOptionalBoolArgument(rootCmd, trustServerCertificate)
+	args.EnableColumnEncryption = GetOptionalBoolArgument(rootCmd, enableColumnEncryption)
+}
+
+// returns nil if the argument was not set by the user, otherwise returns set value
+func GetOptionalBoolArgument(cmd *cobra.Command, name string) (b *bool) {
+	val := cmd.Flags().Lookup(name)
+	if val != nil && val.Changed {
+		value := val.Value.String()
+		v, e := strconv.ParseBool(value)
+		if e != nil {
+			return nil
+		}
+		b = &v
+	}
+	return
+}
+
 func setFlags(rootCmd *cobra.Command, args *SQLCmdArguments) {
 	rootCmd.SetFlagErrorFunc(flagErrorHandler)
 	rootCmd.Flags().BoolVarP(&args.Help, "help", "?", false, localizer.Sprintf("-? shows this syntax summary, %s shows modern sqlcmd sub-command help", localizer.HelpFlag))
@@ -384,7 +408,7 @@ func setFlags(rootCmd *cobra.Command, args *SQLCmdArguments) {
 	rootCmd.Flags().StringSliceVarP(&args.InputFile, "input-file", "i", inputfiles, localizer.Sprintf("Identifies one or more files that contain batches of SQL statements. If one or more files do not exist, sqlcmd will exit. Mutually exclusive with %s/%s", localizer.QueryAndExitFlag, localizer.QueryFlag))
 	rootCmd.Flags().StringVarP(&args.OutputFile, "output-file", "o", "", localizer.Sprintf("Identifies the file that receives output from sqlcmd"))
 	rootCmd.Flags().BoolVarP(&args.Version, "version", "", false, localizer.Sprintf("Print version information and exit"))
-	rootCmd.Flags().BoolVarP(&args.TrustServerCertificate, "trust-server-certificate", "C", false, localizer.Sprintf("Implicitly trust the server certificate without validation"))
+	_ = rootCmd.Flags().BoolP(trustServerCertificate, "C", false, localizer.Sprintf("Implicitly trust the server certificate without validation"))
 	rootCmd.Flags().StringVarP(&args.DatabaseName, "database-name", "d", "", localizer.Sprintf("This option sets the sqlcmd scripting variable %s. This parameter specifies the initial database. The default is your login's default-database property. If the database does not exist, an error message is generated and sqlcmd exits", localizer.DbNameVar))
 	rootCmd.Flags().BoolVarP(&args.UseTrustedConnection, "use-trusted-connection", "E", false, localizer.Sprintf("Uses a trusted connection instead of using a user name and password to sign in to SQL Server, ignoring any environment variables that define user name and password"))
 	rootCmd.Flags().StringVarP(&args.BatchTerminator, "batch-terminator", "c", "GO", localizer.Sprintf("Specifies the batch terminator. The default value is %s", localizer.BatchTerminatorGo))
@@ -435,9 +459,10 @@ func setFlags(rootCmd *cobra.Command, args *SQLCmdArguments) {
 	_ = rootCmd.Flags().IntP(removeControlCharacters, "k", 0, localizer.Sprintf("%s Remove control characters from output. Pass 1 to substitute a space per character, 2 for a space per consecutive characters", "-k [1|2]"))
 	rootCmd.Flags().BoolVarP(&args.EchoInput, "echo-input", "e", false, localizer.Sprintf("Echo input"))
 	rootCmd.Flags().IntVarP(&args.QueryTimeout, "query-timeout", "t", 0, "Query timeout")
-	rootCmd.Flags().BoolVarP(&args.EnableColumnEncryption, "enable-column-encryption", "g", false, localizer.Sprintf("Enable column encryption"))
+	_ = rootCmd.Flags().BoolP(enableColumnEncryption, "g", false, localizer.Sprintf("Enable column encryption"))
 	rootCmd.Flags().StringVarP(&args.ChangePassword, "change-password", "z", "", localizer.Sprintf("New password"))
 	rootCmd.Flags().StringVarP(&args.ChangePasswordAndExit, "change-password-exit", "Z", "", localizer.Sprintf("New password and exit"))
+	rootCmd.Flags().StringVarP(&args.ConnectionString, "connection-string", "J", "", localizer.Sprintf("ADO.NET-style connection string"))
 }
 
 func setScriptVariable(v string) string {
@@ -663,55 +688,132 @@ func setVars(vars *sqlcmd.Variables, args *SQLCmdArguments) {
 	}
 }
 
-func setConnect(connect *sqlcmd.ConnectSettings, args *SQLCmdArguments, vars *sqlcmd.Variables) {
+func setConnect(connect *sqlcmd.ConnectSettings, args *SQLCmdArguments, vars *sqlcmd.Variables) error {
 	connect.ApplicationName = "sqlcmd"
+
+	if args.ConnectionString != "" {
+		config, err := msdsn.Parse(args.ConnectionString)
+		if err != nil {
+			return err
+		}
+
+		// The following unpleasantness could be cleaned up by updating go-mssqlb msdsn.Parse() to pass back the serverName.
+		var serverName string
+		protocol, exists := config.Parameters["protocol"]
+		if !exists {
+			protocol = "tcp"
+		}
+		serverName = protocol + ":" + config.Host
+		if len(config.Instance) > 0 {
+			serverName += "\\" + config.Instance
+		}
+		if config.Port != 0 {
+			serverName += "," + strconv.Itoa(int(config.Port))
+		}
+
+		connect.ServerName = serverName
+		connect.UserName = config.User
+		connect.Password = config.Password
+		connect.Database = config.Database
+		// Note that go-mssqldb only supports 'true' and 'false' for TrustServerCertificate, not other valid values like 'yes'/'no':
+		connect.TrustServerCertificate = config.TLSConfig.InsecureSkipVerify
+		connect.LoginTimeoutSeconds = int(config.ConnTimeout.Seconds())
+		connect.ChangePassword = config.ChangePassword
+		connect.WorkstationName = config.Workstation
+		connect.EnableColumnEncryption = config.ColumnEncryption
+		switch config.Encryption {
+		case msdsn.EncryptionOff:
+			connect.Encrypt = "false"
+		case msdsn.EncryptionRequired:
+			connect.Encrypt = "true"
+		case msdsn.EncryptionDisabled:
+			connect.Encrypt = "disable"
+		case msdsn.EncryptionStrict:
+			connect.Encrypt = "strict"
+		}
+		if config.ReadOnlyIntent {
+			connect.ApplicationIntent = "ReadOnly"
+		}
+		//connect.AuthenticationMethod = NOT YET SUPPORTED.
+		// connect.PacketSize = int(config.PacketSize) // NOT WORKING
+	}
+
+	connect.AuthenticationMethod = args.authenticationMethod(connect.Password != "")
+	connect.PacketSize = args.PacketSize
+	connect.UseTrustedConnection = args.UseTrustedConnection
+	connect.DisableEnvironmentVariables = !args.useEnvVars()
+	connect.LogLevel = args.DriverLoggingLevel
+	connect.ExitOnError = args.ExitOnError
+	connect.ErrorSeverityLevel = args.ErrorSeverityLevel
+	connect.DedicatedAdminConnection = args.DedicatedAdminConnection
+	connect.DisableVariableSubstitution = args.DisableVariableSubstitution
+
+	if args.TrustServerCertificate != nil {
+		connect.TrustServerCertificate = *args.TrustServerCertificate
+	}
+
+	if args.EnableColumnEncryption != nil {
+		connect.EnableColumnEncryption = *args.EnableColumnEncryption
+	}
+
+	if len(args.EncryptConnection) > 0 {
+		switch args.EncryptConnection {
+		case "s":
+			connect.Encrypt = "strict"
+		case "o":
+			connect.Encrypt = "optional"
+		case "m":
+			connect.Encrypt = "mandatory"
+		default:
+			connect.Encrypt = args.EncryptConnection
+		}
+	}
+
 	if len(args.Password) > 0 {
 		connect.Password = args.Password
 	} else if args.useEnvVars() {
 		connect.Password = os.Getenv(sqlcmd.SQLCMDPASSWORD)
 	}
-	connect.ServerName = args.Server
-	if connect.ServerName == "" {
+
+	if len(args.Server) > 0 {
+		connect.ServerName = args.Server
+	} else if args.useEnvVars() {
 		connect.ServerName, _ = vars.Get(sqlcmd.SQLCMDSERVER)
 	}
-	connect.Database = args.DatabaseName
-	if connect.Database == "" {
+
+	if len(args.DatabaseName) > 0 {
+		connect.Database = args.DatabaseName
+	} else if args.useEnvVars() {
 		connect.Database, _ = vars.Get(sqlcmd.SQLCMDDBNAME)
 	}
-	connect.UserName = args.UserName
-	if connect.UserName == "" {
+
+	if len(args.UserName) > 0 {
+		connect.UserName = args.UserName
+	} else if args.useEnvVars() {
 		connect.UserName, _ = vars.Get(sqlcmd.SQLCMDUSER)
 	}
-	connect.UseTrustedConnection = args.UseTrustedConnection
-	connect.TrustServerCertificate = args.TrustServerCertificate
-	connect.AuthenticationMethod = args.authenticationMethod(connect.Password != "")
-	connect.DisableEnvironmentVariables = !args.useEnvVars()
-	connect.DisableVariableSubstitution = args.DisableVariableSubstitution
-	connect.ApplicationIntent = args.ApplicationIntent
-	connect.LoginTimeoutSeconds = args.LoginTimeout
-	switch args.EncryptConnection {
-	case "s":
-		connect.Encrypt = "strict"
-	case "o":
-		connect.Encrypt = "optional"
-	case "m":
-		connect.Encrypt = "mandatory"
-	default:
-		connect.Encrypt = args.EncryptConnection
+
+	if len(args.WorkstationName) > 0 {
+		connect.WorkstationName = args.WorkstationName
 	}
-	connect.PacketSize = args.PacketSize
-	connect.WorkstationName = args.WorkstationName
-	connect.LogLevel = args.DriverLoggingLevel
-	connect.ExitOnError = args.ExitOnError
-	connect.ErrorSeverityLevel = args.ErrorSeverityLevel
-	connect.DedicatedAdminConnection = args.DedicatedAdminConnection
-	connect.EnableColumnEncryption = args.EnableColumnEncryption
+
+	if len(args.ApplicationIntent) > 0 {
+		connect.ApplicationIntent = args.ApplicationIntent
+	}
+
 	if len(args.ChangePassword) > 0 {
 		connect.ChangePassword = args.ChangePassword
 	}
+
 	if len(args.ChangePasswordAndExit) > 0 {
 		connect.ChangePassword = args.ChangePasswordAndExit
 	}
+
+	if args.LoginTimeout != -1 {
+		connect.LoginTimeoutSeconds = args.LoginTimeout
+	}
+
+	return nil
 }
 
 func isConsoleInitializationRequired(connect *sqlcmd.ConnectSettings, args *SQLCmdArguments) bool {
@@ -726,7 +828,10 @@ func run(vars *sqlcmd.Variables, args *SQLCmdArguments) (int, error) {
 	}
 
 	var connectConfig sqlcmd.ConnectSettings
-	setConnect(&connectConfig, args, vars)
+	err = setConnect(&connectConfig, args, vars)
+	if err != nil {
+		return 1, err
+	}
 	var line sqlcmd.Console = nil
 	if isConsoleInitializationRequired(&connectConfig, args) {
 		line = console.NewConsole("")
